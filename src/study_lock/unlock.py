@@ -39,4 +39,7 @@ def validate_unlock(
         return UnlockResult(False, "record_unreadable", "学习记录文件无法读取")
     if not record_text.strip():
         return UnlockResult(False, "record_empty", "学习记录文件不能为空")
+    from .records import record_has_user_content
+    if not record_has_user_content(record_path):
+        return UnlockResult(False, "record_no_notes", "请在学习记录中填写真实学习内容，模板和任务勾选不算笔记")
     return UnlockResult(True, "ok", "学习任务和记录检查通过")

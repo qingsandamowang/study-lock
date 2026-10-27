@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
@@ -114,6 +115,19 @@ def simulate_plan(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="study-lock")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    doctor = subparsers.add_parser("doctor", help="validate configuration without starting restrictions or writing files")
+    doctor.add_argument("--workspace", type=Path, required=True)
+    doctor.add_argument("--plan", type=Path, required=True)
+    doctor.add_argument("--date", type=date.fromisoformat)
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--check-browser", action="store_true")
+    doctor.add_argument("--browser", type=Path)
+    doctor.add_argument("--mode", choices=("reminder", "simulate", "enforce"), default="reminder", help="validate for this target mode without starting it")
+    stats = subparsers.add_parser("stats", help="export local learning statistics as JSON, CSV and HTML")
+    stats.add_argument("--workspace", type=Path, required=True)
+    stats.add_argument("--from", dest="start", type=date.fromisoformat, required=True)
+    stats.add_argument("--to", dest="end", type=date.fromisoformat, required=True)
+    stats.add_argument("--out", type=Path, required=True)
     simulate = subparsers.add_parser("simulate", help="show lock decisions without enforcement")
     simulate.add_argument("--plan", type=Path, required=True)
     simulate.add_argument("--workspace", type=Path, required=True)
@@ -132,6 +146,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "doctor":
+        from .doctor import check_config
+        report = check_config(args.workspace, args.plan, today=args.date, check_browser=args.check_browser, browser=args.browser, mode=args.mode)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(f"doctor: {'PASS' if report['ok'] else 'FAIL'} (read-only)")
+            for item in report["checks"]:
+                print(f"[{item['level']}] {item['code']}: {item['message']}")
+        return 0 if report["ok"] else 1
+    if args.command == "stats":
+        from .analytics import collect_stats, export_stats
+        try:
+            report = collect_stats(args.workspace, args.start, args.end)
+            paths = export_stats(report, args.out)
+        except (OSError, ValueError) as exc:
+            print(f"stats: {exc}")
+            return 1
+        print(f"stats: {report['totals']['tasks_completed']}/{report['totals']['tasks_total']} tasks; {report['totals']['checked_in_days']} check-ins; {len(report['warnings'])} data issues")
+        for path in paths:
+            print(path)
+        return 0
     if args.command == "simulate":
         report = simulate_plan(args.plan, args.workspace, today=args.date)
         print(f"simulation: state={report.state.value}")
@@ -223,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 file_opener=session.open_file,
                 enforce_close_guard=args.mode == "enforce",
                 mode_label="强制模式" if args.mode == "enforce" else "模拟模式",
+                health_provider=lambda: session.health_error,
             )
         finally:
             session.stop()

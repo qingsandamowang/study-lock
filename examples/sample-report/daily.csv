@@ -1,0 +1,4 @@
+﻿date,title,plan_found,tasks_total,tasks_completed,completion_percent,plan_complete,planned_minutes,completed_planned_minutes,focus_minutes,checked_in,record_has_notes,carryovers_total,carryovers_completed,issue_count
+2026-07-28,Synthetic demo — day 1,True,2,2,100.0,True,30,30,30.0,True,True,0,0,0
+2026-07-29,Synthetic demo — day 2,True,2,1,50.0,False,30,10,15.0,False,True,0,0,0
+2026-07-30,Synthetic demo — day 3,True,2,0,0.0,False,30,0,0.0,False,False,0,0,0

@@ -60,3 +60,25 @@ def test_record_content_requires_a_real_learning_note(tmp_path: Path):
     path.write_text(path.read_text(encoding="utf-8") + "\n今天理解了输入、处理、输出三段流程。\n", encoding="utf-8")
 
     assert record_has_user_content(path) is True
+
+
+def test_first_section_in_generated_template_accepts_real_notes(tmp_path: Path):
+    path = ensure_record(tmp_path, make_plan())
+    assert not record_has_user_content(path)
+    text = path.read_text(encoding="utf-8").replace("## 今天完成了什么\n", "## 今天完成了什么\n- 跑通了示例并比较输出。\n")
+    path.write_text(text, encoding="utf-8")
+    assert record_has_user_content(path)
+
+
+def test_multiline_comments_and_empty_checkboxes_are_not_user_content(tmp_path: Path):
+    path = tmp_path / "record.md"
+    path.write_text("## 今日完成\n<!--\nexample instructions\n-->\n- [ ]\n- [x]\n", encoding="utf-8")
+    assert not record_has_user_content(path)
+
+
+def test_questions_in_free_note_section_count_but_prefilled_tasks_do_not(tmp_path):
+    path = tmp_path / "record.md"
+    path.write_text("## 任务完成情况\n- [x] Read\n", encoding="utf-8")
+    assert not record_has_user_content(path)
+    path.write_text("## 疑问与待查资料\n- Why does the second output differ?\n", encoding="utf-8")
+    assert record_has_user_content(path)

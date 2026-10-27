@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import shutil
+import re
 from pathlib import Path
 
 from .models import DailyPlan
 from .storage import resolve_workspace_path
 
 
-_USER_NOTE_SECTIONS = {"今日完成", "我真正理解的内容", "实验与证据", "明天的起点"}
+_USER_NOTE_SECTIONS = {"今天完成了什么", "今日完成", "我真正理解的内容", "实验与证据", "明天的起点", "疑问与待查资料"}
+_TEMPLATE_SECTIONS = _USER_NOTE_SECTIONS | {"今日目标", "任务完成情况", "复盘问题"}
 
 
 def record_path(workspace_root: Path, plan: DailyPlan) -> Path:
@@ -77,20 +79,22 @@ def record_has_user_content(path: Path) -> bool:
     if not path.is_file():
         return False
     try:
-        lines = _read_text_fallback(path).splitlines()
+        text = re.sub(r"<!--.*?(?:-->|$)", "", _read_text_fallback(path), flags=re.DOTALL)
+        lines = text.splitlines()
     except OSError:
         return False
+    structured = any(line.strip().removeprefix("## ") in _TEMPLATE_SECTIONS for line in lines if line.strip().startswith("## "))
     section: str | None = None
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("## "):
             section = stripped[3:].strip()
             continue
-        if section not in _USER_NOTE_SECTIONS or not stripped or stripped.startswith("<!--"):
+        if (structured and section not in _USER_NOTE_SECTIONS) or not stripped or stripped.startswith("#"):
             continue
-        if stripped.startswith("-"):
-            stripped = stripped[1:].strip()
-        if stripped and not stripped.startswith("<!--"):
+        stripped = re.sub(r"^[-*+]\s*", "", stripped)
+        stripped = re.sub(r"^\[[ xX]\]\s*", "", stripped).strip()
+        if stripped and stripped != "---":
             return True
     return False
 

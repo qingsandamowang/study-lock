@@ -11,11 +11,11 @@ from urllib.parse import urlparse
 from .browser import (
     CHROME_PROCESS_NAME,
     close_processes_by_name,
-    collect_owned_process_ids,
+    collect_owned_processes,
     find_chrome_executable,
     launch_controlled_browser,
     stop_controlled_browser,
-    wait_for_owned_process_ids,
+    wait_for_owned_processes,
 )
 from .controller import StudyLockController
 from .domain_rules import normalize_domain
@@ -45,7 +45,7 @@ class StudyLockSession:
         chrome_finder: Callable[[], Path | None] = find_chrome_executable,
         ordinary_chrome_closer: Callable[[], object] = close_processes_by_name,
         browser_launcher: Callable[..., object] = launch_controlled_browser,
-        browser_stopper: Callable[[set[int], Path | None, set[int]], None] = stop_controlled_browser,
+        browser_stopper: Callable[[set[int], Path | None, dict[int, float]], None] = stop_controlled_browser,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.plan_path = Path(plan_path)
@@ -69,6 +69,10 @@ class StudyLockSession:
         self.browser_process: object | None = None
         self.browser_root_pids: set[int] = set()
         self.owned_browser_pids: set[int] = set()
+        self.browser_identities: dict[int, float] = {}
+        self.health_error: str | None = None
+        self.cleanup_errors: list[str] = []
+        self._stop_lock = threading.Lock()
         self.browser_profile_dir: Path | None = None
         self.browser_status = "not started"
         self.logged_guard_events: set[tuple[str, str]] = set()
@@ -80,6 +84,15 @@ class StudyLockSession:
         return self.workspace_root / "study-lock/runtime/events.jsonl"
 
     def start(self) -> RuntimeState:
+        if self.guard_thread is not None and self.guard_thread.is_alive():
+            return self.controller.state
+        self.health_error = None
+        try:
+            return self._start_runtime()
+        except Exception as exc:
+            return self._fail_safe(exc, "runtime_failed")
+
+    def _start_runtime(self) -> RuntimeState:
         state = self.controller.start()
         if state.status is not LockState.LOCKED or self.controller.plan is None:
             return state
@@ -119,29 +132,23 @@ class StudyLockSession:
                     url=f"https://{first_domain}" if first_domain else None,
                 )
                 self.browser_root_pids = {int(self.browser_process.pid)}
-                self.owned_browser_pids.update(
-                    wait_for_owned_process_ids(self.browser_root_pids, self.browser_profile_dir)
-                )
+                self.browser_identities.update(wait_for_owned_processes(self.browser_root_pids, self.browser_profile_dir))
+                self.owned_browser_pids.update(self.browser_identities)
                 self.browser_status = "controlled Chrome started"
             except Exception as exc:
-                append_event(
-                    self.events_path,
-                    "browser_safe_config",
-                    {"reason": str(exc)},
-                )
-                self.stop()
-                return self.controller._set_state(LockState.SAFE_CONFIG)
+                return self._fail_safe(exc, "browser_safe_config")
 
         self.guard = ProcessGuard(
             allowed_apps,
             simulation=self.simulation,
             owned_process_ids=self.owned_browser_pids,
+            owned_process_identities=self.browser_identities,
             restricted_process_names={CHROME_PROCESS_NAME},
         )
         self.stop_event.clear()
         self.guard_thread = threading.Thread(target=self._guard_loop, daemon=True)
         self.guard_thread.start()
-        return state
+        return self.controller.state
 
     def refresh_overrides(self) -> None:
         overrides = load_overrides(self.workspace_root / "study-lock/runtime", self.today)
@@ -180,29 +187,40 @@ class StudyLockSession:
             url=target,
         )
         self.browser_root_pids.add(int(process.pid))
-        self.owned_browser_pids.update(
-            wait_for_owned_process_ids(self.browser_root_pids, self.browser_profile_dir)
-        )
+        self.browser_identities.update(wait_for_owned_processes(self.browser_root_pids, self.browser_profile_dir))
+        self.owned_browser_pids.update(self.browser_identities)
         return process
 
     def _guard_loop(self) -> None:
-        while not self.stop_event.wait(1.0):
-            if self.guard is None:
-                return
-            if self.browser_root_pids:
-                self.owned_browser_pids.update(
-                    collect_owned_process_ids(self.browser_root_pids, self.browser_profile_dir)
-                )
-            for result in self.guard.inspect_all():
-                if (
-                    result.action in {"would_block", "blocked", "error"}
-                    and should_log_guard_event(self.logged_guard_events, result)
-                ):
-                    append_event(
-                        self.events_path,
-                        "process_guard",
-                        {"process": result.process_name, "action": result.action, "reason": result.reason},
-                    )
+        try:
+            while not self.stop_event.wait(1.0):
+                guard = self.guard
+                if guard is None:
+                    return
+                if self.browser_root_pids:
+                    fresh = collect_owned_processes(self.browser_root_pids, self.browser_profile_dir, self.browser_identities)
+                    self.browser_identities.clear()
+                    self.browser_identities.update(fresh)
+                    self.owned_browser_pids.clear()
+                    self.owned_browser_pids.update(fresh)
+                for result in guard.inspect_all():
+                    if result.action in {"would_block", "blocked", "error"} and should_log_guard_event(self.logged_guard_events, result):
+                        append_event(self.events_path, "process_guard", {"process": result.process_name, "action": result.action, "reason": result.reason})
+        except Exception as exc:
+            self._fail_safe(exc, "guard_failed")
+
+    def _fail_safe(self, exc: Exception, event: str) -> RuntimeState:
+        self.health_error = str(exc)
+        # Set memory before I/O: disk failure must not hide the degraded status.
+        self.controller.state = RuntimeState(self.today, LockState.SAFE_CONFIG, str(self.plan_path))
+        try:
+            self.controller._set_state(LockState.SAFE_CONFIG)
+            append_event(self.events_path, event, {"reason": str(exc)})
+        except OSError as write_error:
+            self.cleanup_errors.append(str(write_error))
+        finally:
+            self.stop()
+        return self.controller.state
 
     def request_unlock(self) -> RuntimeState:
         state = self.controller.request_unlock()
@@ -218,25 +236,27 @@ class StudyLockSession:
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self.proxy is not None:
-            self.proxy.shutdown()
-            self.proxy.server_close()
-        if self.proxy_thread is not None:
-            self.proxy_thread.join(timeout=2)
-        if self.guard_thread is not None:
-            self.guard_thread.join(timeout=2)
-        if self.browser_root_pids:
-            self.browser_stopper(
-                self.browser_root_pids,
-                self.browser_profile_dir,
-                self.owned_browser_pids,
-            )
-        self.browser_root_pids.clear()
-        self.owned_browser_pids.clear()
-        self.browser_process = None
-        self.browser_profile_dir = None
-        self.proxy = None
-        self.proxy_thread = None
-        self.guard_thread = None
-        self.guard = None
+        # Detach once under a short lock; joins and shutdown must never hold it.
+        with self._stop_lock:
+            proxy, proxy_thread, guard_thread = self.proxy, self.proxy_thread, self.guard_thread
+            roots, profile, identities = set(self.browser_root_pids), self.browser_profile_dir, dict(self.browser_identities)
+            self.proxy = self.proxy_thread = self.guard_thread = self.guard = None
+            self.browser_process = self.browser_profile_dir = None
+            self.browser_root_pids.clear()
+            self.owned_browser_pids.clear()
+            self.browser_identities.clear()
+        def cleanup(action):
+            try:
+                action()
+            except Exception as exc:
+                self.cleanup_errors.append(str(exc))
+        if proxy is not None:
+            if proxy_thread is None or proxy_thread.is_alive():
+                cleanup(proxy.shutdown)
+            cleanup(proxy.server_close)
+        for thread in (proxy_thread, guard_thread):
+            if thread is not None and thread is not threading.current_thread():
+                cleanup(lambda thread=thread: thread.join(timeout=2))
+        if roots or identities:
+            cleanup(lambda: self.browser_stopper(roots, profile, identities))
         self.browser_status = "stopped"

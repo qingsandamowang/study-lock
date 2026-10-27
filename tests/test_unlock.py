@@ -52,6 +52,15 @@ def test_unlock_accepts_completed_tasks_and_non_empty_record(tmp_path: Path):
     assert result.code == "ok"
 
 
+def test_unlock_rejects_untouched_generated_template(tmp_path: Path):
+    from study_lock.records import ensure_record
+    plan = make_plan()
+    ensure_record(tmp_path, plan)
+    result = validate_unlock(plan, tmp_path, today=date(2026, 7, 28))
+    assert not result.allowed
+    assert result.code == "record_no_notes"
+
+
 def test_unlock_checks_detailed_workflow_when_present(tmp_path: Path):
     record = tmp_path / "learning-records/today.md"
     record.parent.mkdir()

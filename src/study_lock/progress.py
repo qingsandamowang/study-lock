@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
+import math
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .models import DailyPlan, LearningResource
+from .storage import atomic_write_json
 
 
 @dataclass
@@ -25,6 +27,10 @@ class DailyProgress:
     checked_in: bool = False
     completed_at: str | None = None
     carryovers: list[CarryoverTask] = field(default_factory=list)
+    focus_seconds: float = 0.0
+
+
+_PROGRESS_LOCK = threading.RLock()
 
 
 def progress_path(workspace_root: Path, day: date) -> Path:
@@ -41,6 +47,8 @@ def _carryover_from_dict(payload: object) -> CarryoverTask | None:
     if not isinstance(payload, dict):
         return None
     try:
+        if not isinstance(payload.get("completed", False), bool):
+            return None
         resource_payload = payload.get("resource")
         resource = LearningResource(**resource_payload) if isinstance(resource_payload, dict) else None
         return CarryoverTask(
@@ -54,28 +62,44 @@ def _carryover_from_dict(payload: object) -> CarryoverTask | None:
         return None
 
 
-def load_daily_progress(workspace_root: Path, day: date) -> DailyProgress:
+def _focus_seconds(value: object) -> float:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("focus_seconds must be finite and nonnegative")
+        return float(value)
+    except OverflowError as exc:
+        raise ValueError("focus_seconds is too large") from exc
+
+
+def _decode_progress(payload: object, day: date) -> DailyProgress:
+    if not isinstance(payload, dict) or payload.get("day", day.isoformat()) != day.isoformat():
+        raise ValueError("invalid progress date or object")
+    if not isinstance(payload.get("checked_in", False), bool) or not isinstance(payload.get("carryovers", []), list):
+        raise ValueError("invalid check-in or carryover data")
+    seconds = _focus_seconds(payload.get("focus_seconds", 0))
+    items = [_carryover_from_dict(raw) for raw in payload.get("carryovers", [])]
+    if any(item is None for item in items):
+        raise ValueError("invalid carryover item")
+    completed_at = payload.get("completed_at")
+    if completed_at is not None and not isinstance(completed_at, str):
+        raise ValueError("completed_at must be text or null")
+    return DailyProgress(day, payload.get("checked_in", False), completed_at, items, float(seconds))
+
+
+def load_daily_progress(workspace_root: Path, day: date, *, warnings: list[str] | None = None) -> DailyProgress:
     path = progress_path(workspace_root, day)
     for candidate in (path, path.with_suffix(path.suffix + ".bak")):
         if not candidate.is_file():
             continue
         try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            progress = _decode_progress(json.loads(candidate.read_text(encoding="utf-8")), day)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            if warnings is not None:
+                warnings.append(f"{day}: invalid progress in {candidate.name}")
             continue
-        if not isinstance(payload, dict):
-            continue
-        carryovers = [
-            item
-            for raw in payload.get("carryovers", [])
-            if (item := _carryover_from_dict(raw)) is not None
-        ]
-        return DailyProgress(
-            day=day,
-            checked_in=bool(payload.get("checked_in", False)),
-            completed_at=str(payload["completed_at"]) if payload.get("completed_at") else None,
-            carryovers=carryovers,
-        )
+        if candidate != path and warnings is not None:
+            warnings.append(f"{day}: progress recovered from backup (read-only)")
+        return progress
     return DailyProgress(day)
 
 
@@ -87,24 +111,26 @@ def save_daily_progress(workspace_root: Path, progress: DailyProgress) -> Path:
         "checked_in": progress.checked_in,
         "completed_at": progress.completed_at,
         "carryovers": [_carryover_to_dict(item) for item in progress.carryovers],
+        "focus_seconds": progress.focus_seconds,
     }
+    _decode_progress(payload, progress.day)
     if path.is_file():
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            _decode_progress(json.loads(path.read_text(encoding="utf-8")), progress.day)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
         else:
             shutil.copyfile(path, path.with_suffix(path.suffix + ".bak"))
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", prefix=f".{path.stem}-", dir=path.parent, delete=False) as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-            temporary = Path(handle.name)
-        temporary.replace(path)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
+    atomic_write_json(path, payload)
     return path
+
+
+def add_focus_seconds(workspace_root: Path, day: date, seconds: float) -> Path:
+    seconds = _focus_seconds(seconds)
+    with _PROGRESS_LOCK:
+        progress = load_daily_progress(workspace_root, day)
+        progress.focus_seconds += seconds
+        return save_daily_progress(workspace_root, progress)
 
 
 def unfinished_tasks(plan: DailyPlan) -> list[CarryoverTask]:

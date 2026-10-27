@@ -127,3 +127,10 @@ def test_inspect_all_applies_guard_to_each_process(monkeypatch):
     results = ProcessGuard({"code.exe"}, simulation=True).inspect_all()
 
     assert [result.action for result in results] == ["allow", "would_block"]
+
+
+def test_reused_owned_pid_is_not_allowed_by_stale_identity():
+    process = FakeProcess("chrome.exe", process_id=42)
+    process.create_time = lambda: 20.0
+    guard = ProcessGuard(set(), simulation=True, owned_process_ids={42}, owned_process_identities={42: 10.0}, restricted_process_names={"chrome.exe"})
+    assert guard.inspect(process).action == "would_block"

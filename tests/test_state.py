@@ -28,3 +28,18 @@ def test_append_event_writes_one_json_object_per_line(tmp_path: Path):
 
     assert events_path.read_text(encoding="utf-8").count("\n") == 1
     assert '"event": "locked"' in events_path.read_text(encoding="utf-8")
+def test_state_save_uses_atomic_replace(monkeypatch, tmp_path):
+    from pathlib import Path
+    from datetime import date
+    from study_lock.state import RuntimeState, LockState, save_state
+    path = tmp_path / "state.json"
+    save_state(path, RuntimeState(date(2026, 7, 28), LockState.LOCKED))
+    previous = path.read_bytes()
+    def fail(*_args):
+        raise OSError("replace unavailable")
+    monkeypatch.setattr(Path, "replace", fail)
+    import pytest
+    with pytest.raises(OSError, match="replace"):
+        save_state(path, RuntimeState(date(2026, 7, 28), LockState.UNLOCKED))
+    assert path.read_bytes() == previous
+    assert len(list(tmp_path.iterdir())) == 1

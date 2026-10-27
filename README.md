@@ -9,8 +9,11 @@
 - 解析每日目标、执行清单、允许的应用/域名和学习记录路径。
 - 展示资料按钮、学习计时、复盘与计划编辑界面。
 - 通过本地代理和进程守卫实现可选限制；默认 UI 使用提醒模式。
-- 检查当天日期、任务勾选状态和非空学习记录，决定是否解锁。
+- 检查当天日期、任务勾选状态和真实学习笔记，决定是否解锁；兼容旧版纯文本记录。
 - 提供等待 60 秒并输入确认短语的紧急恢复，保存事件日志。
+- 只读 `doctor` 预检计划、日期、路径、资源和规则；浏览器检查可选。
+- 按日期范围聚合学习进度、分钟和打卡，导出 JSON、CSV 与离线 HTML。
+- 守护故障降级 SAFE_CONFIG 并清理资源，状态/进度原子替换；受控浏览器用 PID 与创建时间核验归属。
 
 ## 安装与安全演示
 
@@ -20,7 +23,8 @@
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e . pytest
-python -m pytest -q
+python -m pytest -q -p no:cacheprovider --basetemp "$env:TEMP/study-lock-check-$([guid]::NewGuid().ToString('N'))"
+python -m study_lock.cli doctor --workspace examples/demo-workspace --plan examples/demo-workspace/study-plans/daily/2026-07-28.md --date 2026-07-28
 python -m study_lock.cli simulate --workspace examples/demo-workspace --plan examples/demo-workspace/study-plans/daily/2026-07-28.md --date 2026-07-28
 ```
 
@@ -32,11 +36,22 @@ python -m study_lock.cli ui --mode simulate --workspace examples/demo-workspace 
 
 日常使用时，将示例计划复制到自己的工作区 `study-plans/daily/YYYY-MM-DD.md`，同步标题日期、记录路径和白名单。推荐从 `--mode reminder` 提醒模式开始。
 
+## 统计导出
+
+```powershell
+python -m study_lock.cli stats --workspace examples/demo-workspace --from 2026-07-28 --to 2026-07-30 --out reports/demo
+python examples/generate_sample_report.py
+```
+
+`stats` 只读源数据，写出 `summary.json`、`daily.csv`、`report.html`。分钟分为显式标签中的计划时长、已完成任务的时长估算、计时器实际记录秒数换算值；旧记录没有计时字段时为 0。缺失/损坏数据会保留在问题列表中。CSV 处理引号和公式前缀，HTML 转义文本。
+
+查看 [合成示例报告](examples/sample-report/report.html)：数值是公开演示用的虚构进度，不是个人活动记录。字段定义、故障机制、兼容性和回归路线见 [学习与验证说明](LEARNING-GUIDE.md)。
+
 ## 强制模式与边界
 
 `ui --mode enforce` 会启动网站代理及进程守卫，可能结束白名单外的普通用户进程；应先保存其他应用的工作，确认规则和恢复流程。系统进程、Python、工具自身等受保护。
 
-解锁要求当天计划的任务全部勾选，且指定学习记录非空。紧急恢复需要等待 60 秒并输入 `I ACCEPT RECOVERY`。这是增加分心成本的个人工具，不能保证无法绕过。
+解锁要求当天计划的任务全部勾选，且指定学习记录有真实内容；未填写模板、预填任务与注释不能通过。“今天完成了什么”和旧版“今日完成”都能识别；旧版纯文本笔记继续兼容。紧急恢复需要完整等待 60 秒并输入 `I ACCEPT RECOVERY`；取消或输入错误后可以重新请求。守护故障时进入 SAFE_CONFIG，界面提示错误并允许关闭。这是增加分心成本的个人工具，不能保证无法绕过。
 
 自动化测试覆盖解析、代理规则、进程检查、状态流转、恢复、界面辅助和集成流程。测试通过不代表在所有 Windows 环境完成强制模式验收；本仓库不包含个人浏览器资料、推送令牌、实际学习记录或本机运行状态。
 
@@ -51,4 +66,4 @@ launcher.py             提醒模式启动入口，默认使用仓库父目录�
 
 如需开机启动，可按自己的解释器路径调用 `python -m study_lock.cli startup install --launcher ./launcher.py`；这一步由使用者主动执行。原始本机快捷方式安装器及论文资料生成脚本不在公开包中。
 
-[内容包格式](CONTENT-COCKPIT.md) · [界面使用说明](USAGE-A-PLUS.md) · [来源与归属](THIRD_PARTY_NOTICES.md)
+[内容包格式](CONTENT-COCKPIT.md) · [界面使用说明](USAGE-A-PLUS.md) · [学习与验证说明](LEARNING-GUIDE.md) · [来源与归属](THIRD_PARTY_NOTICES.md)

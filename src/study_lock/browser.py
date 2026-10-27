@@ -119,12 +119,30 @@ def collect_owned_process_ids(
     root_pids: set[int],
     profile_dir: Path | None = None,
 ) -> set[int]:
-    owned: set[int] = set()
-    for root_pid in root_pids:
+    return set(collect_owned_processes(root_pids, profile_dir))
+
+
+def collect_owned_processes(
+    root_pids: set[int],
+    profile_dir: Path | None = None,
+    identities: dict[int, float] | None = None,
+) -> dict[int, float]:
+    """Return fresh PID/create-time identities backed by prior identity or profile evidence."""
+    owned: dict[int, float] = {}
+    known = dict(identities or {})
+    for root_pid in set(root_pids) | known.keys():
         try:
             root = psutil.Process(root_pid)
-            owned.add(root.pid)
-            owned.update(child.pid for child in root.children(recursive=True))
+            if root_pid in known:
+                verified = root.create_time() == known[root_pid]
+            else:
+                verified = profile_dir is not None and root.name().lower() == CHROME_PROCESS_NAME and _profile_argument_matches(root.cmdline(), profile_dir)
+            if not verified:
+                continue
+            owned[root.pid] = root.create_time()
+            for child in root.children(recursive=True):
+                if child.name().lower() == CHROME_PROCESS_NAME:
+                    owned[child.pid] = child.create_time()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     if profile_dir is not None:
@@ -133,9 +151,20 @@ def collect_owned_process_ids(
                 if str(process.info.get("name") or "").lower() != CHROME_PROCESS_NAME:
                     continue
                 if _profile_argument_matches(process.info.get("cmdline"), profile_dir):
-                    owned.add(process.pid)
+                    owned[process.pid] = process.create_time()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+    return owned
+
+
+def wait_for_owned_processes(root_pids: set[int], profile_dir: Path, *, timeout: float = 1.5) -> dict[int, float]:
+    deadline = time.monotonic() + timeout
+    owned: dict[int, float] = {}
+    while time.monotonic() < deadline:
+        owned = collect_owned_processes(root_pids, profile_dir, owned)
+        if len(owned) > len(root_pids) or not any(psutil.pid_exists(pid) for pid in root_pids):
+            return owned
+        time.sleep(0.05)
     return owned
 
 
@@ -160,25 +189,35 @@ def wait_for_owned_process_ids(
 def stop_controlled_browser(
     root_pids: set[int],
     profile_dir: Path | None = None,
-    owned_pids: set[int] | None = None,
+    owned_pids: set[int] | dict[int, float] | None = None,
 ) -> None:
     processes = []
-    process_ids = collect_owned_process_ids(root_pids, profile_dir)
-    process_ids.update(owned_pids or set())
-    for pid in process_ids:
+    identities = owned_pids if isinstance(owned_pids, dict) else {}
+    process_ids = collect_owned_processes(root_pids, profile_dir, identities)
+    for pid, created in identities.items():
         try:
-            processes.append(psutil.Process(pid))
+            if psutil.Process(pid).create_time() == created:
+                process_ids[pid] = created
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    for pid, created in process_ids.items():
+        try:
+            process = psutil.Process(pid)
+            if process.create_time() == created:
+                processes.append(process)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
     for process in processes:
         try:
-            process.terminate()
+            if process.create_time() == process_ids[process.pid]:
+                process.terminate()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     _, alive = psutil.wait_procs(processes, timeout=3)
     for process in alive:
         try:
-            process.kill()
+            if process.create_time() == process_ids[process.pid]:
+                process.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

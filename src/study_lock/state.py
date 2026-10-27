@@ -6,6 +6,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from .storage import atomic_write_json
 
 
 class LockState(StrEnum):
@@ -30,7 +31,7 @@ def save_state(path: Path, state: RuntimeState) -> None:
         "status": state.status.value,
         "plan_path": state.plan_path,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def load_state(path: Path, default_date: date | None = None) -> RuntimeState:

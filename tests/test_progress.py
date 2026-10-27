@@ -166,3 +166,37 @@ def test_corrupt_progress_file_recovers_from_backup(tmp_path: Path):
     path.write_text("{broken", encoding="utf-8")
 
     assert load_daily_progress(tmp_path, day) == progress
+
+
+def test_malformed_progress_shape_recovers_from_valid_backup(tmp_path: Path):
+    import json
+    from study_lock.progress import progress_path
+    day = date(2026, 7, 30)
+    expected = DailyProgress(day, checked_in=True)
+    save_daily_progress(tmp_path, expected)
+    path = progress_path(tmp_path, day)
+    path.with_suffix(".json.bak").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    path.write_text(json.dumps({"day": "2026-07-29", "checked_in": "false", "carryovers": None}), encoding="utf-8")
+    assert load_daily_progress(tmp_path, day) == expected
+
+
+def test_focus_seconds_round_trip_and_accumulate_without_losing_checkin(tmp_path):
+    from study_lock.progress import add_focus_seconds
+    day = date(2026, 7, 30)
+    save_daily_progress(tmp_path, DailyProgress(day, checked_in=True))
+    add_focus_seconds(tmp_path, day, 30.5)
+    add_focus_seconds(tmp_path, day, 59.5)
+    loaded = load_daily_progress(tmp_path, day)
+    assert loaded.checked_in is True
+    assert loaded.focus_seconds == 90
+
+
+def test_progress_with_invalid_focus_seconds_recovers_from_backup(tmp_path):
+    from study_lock.progress import progress_path
+    day = date(2026, 7, 30)
+    expected = DailyProgress(day, checked_in=True)
+    save_daily_progress(tmp_path, expected)
+    path = progress_path(tmp_path, day)
+    path.with_suffix(".json.bak").write_bytes(path.read_bytes())
+    path.write_text('{"day":"2026-07-30","focus_seconds":-5}', encoding="utf-8")
+    assert load_daily_progress(tmp_path, day).checked_in is True

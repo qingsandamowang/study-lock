@@ -80,6 +80,7 @@ class ProcessGuard:
         simulation: bool = True,
         protected_names: set[str] | None = None,
         owned_process_ids: set[int] | None = None,
+        owned_process_identities: dict[int, float] | None = None,
         restricted_process_names: set[str] | None = None,
     ) -> None:
         self.allowed_apps = {name.lower() for name in allowed_apps}
@@ -88,6 +89,7 @@ class ProcessGuard:
             name.lower() for name in (protected_names or PROTECTED_PROCESS_NAMES)
         }
         self.owned_process_ids = owned_process_ids if owned_process_ids is not None else set()
+        self.owned_process_identities = owned_process_identities
         self.restricted_process_names = {
             name.lower() for name in (restricted_process_names or set())
         }
@@ -110,7 +112,12 @@ class ProcessGuard:
             pass
 
         if process_id in self.owned_process_ids:
-            return GuardResult(process_name, "allow", "process is owned by Study Lock")
+            try:
+                verified = self.owned_process_identities is None or process.create_time() == self.owned_process_identities.get(process_id)
+            except Exception:
+                verified = False
+            if verified:
+                return GuardResult(process_name, "allow", "process is owned by Study Lock")
         if (
             process_name in self.protected_names
             or _is_codex_runtime_process(process_name)

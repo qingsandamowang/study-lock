@@ -7,6 +7,7 @@ import locale
 import subprocess
 import threading
 import time
+import math
 import tkinter as tk
 import webbrowser
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from .notifications import PushPlusConfig, load_pushplus_config, save_pushplus_c
 from .planning import detailed_plan_template, save_plan, sync_plan_date_heading
 from .plan_parser import parse_plan, write_section_checkbox_state
 from .progress import (
+    add_focus_seconds,
     CarryoverTask,
     DailyProgress,
     can_check_in,
@@ -661,7 +663,7 @@ def build_tomorrow_tab(
 
 
 class FocusTimerPanel:
-    def __init__(self, parent: tk.Misc, plan: DailyPlan) -> None:
+    def __init__(self, parent: tk.Misc, plan: DailyPlan, *, on_focus_seconds: Callable[[float], object] | None = None) -> None:
         self.window = tk.Toplevel(parent)
         self.window.title("Study Lock · 专注计时器")
         self.window.geometry("560x360")
@@ -669,6 +671,8 @@ class FocusTimerPanel:
         self.window.transient(parent)
         self.stages = build_focus_stages(plan.workflow or plan.tasks)
         self.state = initial_timer_state(self.stages)
+        self.on_focus_seconds = on_focus_seconds
+        self._last_focus_tick: float | None = None
         self.tick_job: str | None = None
         self.stage_var = tk.StringVar()
         self.time_var = tk.StringVar()
@@ -701,23 +705,27 @@ class FocusTimerPanel:
 
     def _start(self) -> None:
         self.state = start_timer(self.state)
+        self._last_focus_tick = time.monotonic()
         self.status_var.set("专注进行中")
         self._refresh()
         self._schedule_tick()
 
     def _pause(self) -> None:
+        self._record_elapsed()
         self.state = pause_timer(self.state)
         self.status_var.set("已暂停")
         self._cancel_tick()
         self._refresh()
 
     def _reset(self) -> None:
+        self._record_elapsed()
         self._cancel_tick()
         self.state = reset_timer(self.stages)
         self.status_var.set("已重置")
         self._refresh()
 
     def _skip(self) -> None:
+        self._record_elapsed()
         self._cancel_tick()
         if self.state.stage_index + 1 >= len(self.stages):
             self.state = TimerState(self.state.stage_index, 0, False)
@@ -737,6 +745,7 @@ class FocusTimerPanel:
 
     def _tick(self) -> None:
         self.tick_job = None
+        self._record_elapsed()
         self.state, finished = tick_timer(self.state, self.stages)
         self._refresh()
         if finished:
@@ -750,9 +759,24 @@ class FocusTimerPanel:
             self.tick_job = None
 
     def close(self) -> None:
+        self._record_elapsed()
+        self.state = pause_timer(self.state)
         self._cancel_tick()
         if self.window.winfo_exists():
             self.window.destroy()
+
+    def _record_elapsed(self) -> None:
+        now = time.monotonic()
+        previous = self._last_focus_tick
+        self._last_focus_tick = now if self.state.running else None
+        if previous is None or not self.state.running or self.on_focus_seconds is None:
+            return
+        seconds = min(max(0.0, now - previous), float(self.state.remaining_seconds))
+        if seconds > 0:
+            try:
+                self.on_focus_seconds(seconds)
+            except (OSError, ValueError) as exc:
+                self.status_var.set(f"专注时长保存失败：{exc}")
 
 
 class CheckinCalendarPanel:
@@ -846,6 +870,7 @@ class StudyPanel:
         enforce_close_guard: bool = False,
         mode_label: str = "模拟模式",
         reminder_enabled: bool = False,
+        health_provider: Callable[[], str | None] | None = None,
     ) -> None:
         self.root = root
         self.plan = plan
@@ -860,6 +885,8 @@ class StudyPanel:
         self.file_opener = file_opener
         self.enforce_close_guard = enforce_close_guard
         self.reminder_enabled = reminder_enabled
+        self.health_provider = health_provider
+        self._health_job: str | None = None
         self.notification_config = load_pushplus_config(self.workspace_root)
         previous_plan = None
         previous_path = self.workspace_root / "study-plans" / "daily" / f"{(self.current_date - timedelta(days=1)).isoformat()}.md"
@@ -869,6 +896,7 @@ class StudyPanel:
             except (OSError, ValueError):
                 previous_plan = None
         self.daily_progress = prepare_daily_progress(self.workspace_root, self.current_date, self.plan, previous_plan)
+        self._focus_timer: FocusTimerPanel | None = None
         self.checkin_button: ttk.Button | None = None
         self.carryover_controls: list[tuple[int, CarryoverTask, tk.Checkbutton]] = []
         self._reminder_job: str | None = None
@@ -879,6 +907,19 @@ class StudyPanel:
         configure_ui_style(self.root)
         self._build()
         self._start_reminders()
+        if self.health_provider is not None:
+            self._health_job = self.root.after(1000, self._check_health)
+
+    def _check_health(self) -> None:
+        self._health_job = None
+        error = self.health_provider() if self.health_provider is not None else None
+        if error:
+            self.enforce_close_guard = False
+            self.status_var.set(f"SAFE_CONFIG · 限制已停止：{error}")
+            messagebox.showwarning("运行故障：已停止限制", f"{error}\n\n已进入 SAFE_CONFIG，可以关闭窗口并检查配置。", parent=self.root)
+            return
+        if self.health_provider is not None:
+            self._health_job = self.root.after(1000, self._check_health)
 
     def _build(self) -> None:
         self.root.title("Study Lock · 今日学习内容")
@@ -939,7 +980,7 @@ class StudyPanel:
         ttk.Label(actions, textvariable=self.status_var, style="Subtitle.TLabel").pack(side="left", padx=(2, 12))
         ttk.Button(actions, text="记录学习成果", style="Primary.TButton", command=self._open_record).pack(side="left", padx=(0, 8))
         if self.reminder_enabled:
-            ttk.Button(actions, text="专注计时器", style="Secondary.TButton", command=lambda: FocusTimerPanel(self.root, self.plan)).pack(side="left", padx=(0, 8))
+            ttk.Button(actions, text="专注计时器", style="Secondary.TButton", command=self._open_focus_timer).pack(side="left", padx=(0, 8))
             ttk.Button(actions, text="打卡与日历", style="Secondary.TButton", command=lambda: CheckinCalendarPanel(self.root, self.workspace_root, self.current_date)).pack(side="left", padx=(0, 8))
             self.checkin_button = ttk.Button(actions, text="完成今日打卡", style="Primary.TButton", command=self._check_in)
             self.checkin_button.pack(side="left", padx=(0, 8))
@@ -951,6 +992,20 @@ class StudyPanel:
             ttk.Button(actions, text="申请解锁", style="Primary.TButton", command=self._request_unlock).pack(side="left")
             ttk.Button(actions, text="紧急恢复", style="Secondary.TButton", command=self._request_recovery).pack(side="right")
         self._update_checkin_state()
+
+    def _open_focus_timer(self) -> None:
+        timer = getattr(self, "_focus_timer", None)
+        if timer is not None and timer.window.winfo_exists():
+            timer.window.deiconify()
+            timer.window.lift()
+            timer.window.focus_set()
+            return
+        day = self.current_date
+        def record(seconds: float) -> None:
+            add_focus_seconds(self.workspace_root, day, seconds)
+            if day == self.current_date:
+                self.daily_progress.focus_seconds = load_daily_progress(self.workspace_root, day).focus_seconds
+        self._focus_timer = FocusTimerPanel(self.root, self.plan, on_focus_seconds=record)
 
     def _build_carryover_panel(self, parent: tk.Misc) -> None:
         box = ttk.LabelFrame(parent, text="昨日未完成 · 自动顺延", style="Notice.TLabelframe", padding=(12, 8))
@@ -1085,6 +1140,9 @@ class StudyPanel:
         if next_plan.plan_date != target_day:
             self.status_var.set(f"新计划日期不匹配：{next_plan.plan_date.isoformat()}")
             return False
+        if self._focus_timer is not None and self._focus_timer.window.winfo_exists():
+            self._focus_timer.close()
+        self._focus_timer = None
         if self._reminder_job is not None:
             self.root.after_cancel(self._reminder_job)
             self._reminder_job = None
@@ -1172,6 +1230,11 @@ class StudyPanel:
         if self._reminder_job is not None:
             self.root.after_cancel(self._reminder_job)
             self._reminder_job = None
+        if self._health_job is not None:
+            self.root.after_cancel(self._health_job)
+            self._health_job = None
+        if self._focus_timer is not None and self._focus_timer.window.winfo_exists():
+            self._focus_timer.close()
         self.root.destroy()
 
     def _open_record(self) -> None:
@@ -1301,8 +1364,9 @@ class StudyPanel:
     def _recovery_tick(self) -> None:
         if self.recovery_gate is None:
             return
-        remaining = max(0, int(self.recovery_gate.delay_seconds - (time.monotonic() - self.recovery_gate.started_at)))
-        if remaining:
+        now = time.monotonic()
+        remaining = max(0, math.ceil(self.recovery_gate.delay_seconds - (now - self.recovery_gate.started_at)))
+        if not self.recovery_gate.ready(now=now):
             self.status_var.set(f"紧急恢复倒计时 {remaining} 秒")
             self.root.after(1000, self._recovery_tick)
             return
@@ -1315,10 +1379,16 @@ class StudyPanel:
             messagebox.showwarning("无法恢复", "当前会话没有配置恢复处理器。", parent=self.root)
             self.recovery_gate = None
             return
-        outcome = self.on_recovery(phrase, self.recovery_gate)
-        if getattr(getattr(outcome, "status", None), "value", None) == "RECOVERY":
-            self.root.destroy()
-        else:
+        try:
+            outcome = self.on_recovery(phrase, self.recovery_gate)
+            if getattr(getattr(outcome, "status", None), "value", None) == "RECOVERY":
+                self.root.destroy()
+            else:
+                self.status_var.set("恢复未生效，可以重新请求紧急恢复")
+        except (ValueError, OSError, RuntimeError) as exc:
+            self.status_var.set("恢复未生效，可以重新请求紧急恢复")
+            messagebox.showwarning("无法恢复", str(exc), parent=self.root)
+        finally:
             self.recovery_gate = None
 
 
@@ -1398,6 +1468,7 @@ def launch_panel(
     enforce_close_guard: bool = False,
     mode_label: str = "模拟模式",
     reminder_enabled: bool = False,
+    health_provider: Callable[[], str | None] | None = None,
 ) -> None:
     root = tk.Tk()
     StudyPanel(
@@ -1415,6 +1486,7 @@ def launch_panel(
         enforce_close_guard=enforce_close_guard,
         mode_label=mode_label,
         reminder_enabled=reminder_enabled,
+        health_provider=health_provider,
     )
     root.mainloop()
 
