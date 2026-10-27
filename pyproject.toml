@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "study-lock"
+version = "0.1.0"
+description = "A local Windows study-mode lock"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.scripts]
+study-lock = "study_lock.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"
